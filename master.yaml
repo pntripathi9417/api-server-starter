@@ -1,0 +1,168 @@
+#cloud-config
+
+---
+write-files:
+  - path: /etc/conf.d/nfs
+    permissions: '0644'
+    content: |
+      OPTS_RPC_MOUNTD=""
+  - path: /opt/bin/wupiao
+    permissions: '0755'
+    content: |
+      #!/bin/bash
+      # [w]ait [u]ntil [p]ort [i]s [a]ctually [o]pen
+      [ -n "$1" ] && \
+        until curl -o /dev/null -sIf http://${1}; do \
+          sleep 1 && echo .;
+        done;
+      exit $?
+
+coreos:
+  etcd2:
+    name: __NAME__
+    listen-client-urls: http://0.0.0.0:2379,http://0.0.0.0:4001
+    advertise-client-urls: http://$public_ipv4:2379,http://$public_ipv4:4001
+    initial-cluster-token: k8s_etcd
+    listen-peer-urls: http://$private_ipv4:2380,http://$private_ipv4:7001
+    initial-advertise-peer-urls: http://$private_ipv4:2380
+    initial-cluster: __ETCD_SEED_CLUSTER__
+    initial-cluster-state: new
+  fleet:
+    public-ip: $public_ipv4
+    metadata: "role=master"
+  flannel:
+    interface: $public_ipv4
+  units:
+    - name: rpcbind.service
+      enable: true
+      command: start
+    - name: rpc-statd.service
+      enable: true
+      command: start
+    - name: flanneld.service
+      command: start
+      drop-ins:
+        - name: 50-network-config.conf
+          content: |
+            [Unit]
+            Requires=etcd2.service
+            [Service]
+            ExecStartPre=/usr/bin/etcdctl set /coreos.com/network/config '{"Network":"10.244.0.0/16", "Backend": {"Type": "host-gw"}}'
+    - name: docker.service
+      command: start
+      drop-ins:
+        - name: 51-docker-mirror.conf
+        - __PROXY_LINE__name: http-proxy.conf
+          __PROXY_LINE__content: |
+            __PROXY_LINE__[Service]
+            __PROXY_LINE__EnvironmentFile=/etc/environment
+      drop-ins:
+        - name: 40-flannel.conf
+          content: |
+            [Unit]
+            Requires=flanneld.service
+            After=flanneld.service
+        - name: 50-docker-options.conf
+          content: |
+            [Service]
+            Environment='DOCKER_OPTS=__DOCKER_OPTIONS__'
+    - name: early-docker.service
+      drop-ins:
+        - __PROXY_LINE__name: http-proxy.conf
+          __PROXY_LINE__content: |
+            __PROXY_LINE__[Service]
+            __PROXY_LINE__EnvironmentFile=/etc/environment
+    - name: kube-certs.service
+      command: start
+      content: |
+        [Unit]
+        Description=Generate Kubernetes API Server certificates
+        ConditionPathExists=/tmp/make-certs.sh
+        Requires=network-online.target
+        After=network-online.target
+        [Service]
+        ExecStartPre=-/usr/sbin/groupadd -r kube-cert
+        ExecStartPre=/usr/bin/chmod 755 /tmp/make-certs.sh
+        ExecStart=/tmp/make-certs.sh $public_ipv4 IP:$public_ipv4,IP:10.100.0.1,DNS:kubernetes,DNS:kubernetes.default,DNS:kubernetes.default.svc,DNS:kubernetes.default.svc.__DNS_DOMAIN__
+        Type=oneshot
+        RemainAfterExit=true
+    - name: hyperkube-image-export.service
+      command: start
+      content: |
+        [Unit]
+        Description=Export Hyperkube rkt image for usage in worker nodes
+        Requires=network-online.target
+        After=network-online.target
+        ConditionPathExists=!/vagrant/binaries/hyperkube___RELEASE__.aci
+        [Service]
+        ExecStartPre=/usr/bin/rkt --trust-keys-from-https fetch quay.io/coreos/hyperkube:__RELEASE___coreos.0
+        ExecStart=/usr/bin/rkt image export quay.io/coreos/hyperkube:__RELEASE___coreos.0 /vagrant/binaries/hyperkube___RELEASE__.aci
+        Type=oneshot
+        RemainAfterExit=true
+    - name: kube-apiserver.service
+      command: start
+      content: |
+        [Unit]
+        Description=Kubernetes API Server
+        Documentation=https://github.com/GoogleCloudPlatform/kubernetes
+        Requires=etcd2.service flanneld.service kube-certs.service
+        After=etcd2.service flanneld.service kube-certs.service
+        [Service]
+        ExecStartPre=/opt/bin/wupiao $private_ipv4:2379/v2/machines
+        ExecStartPre=/bin/chmod +x /vagrant/binaries/kube-apiserver
+        ExecStart=/vagrant/binaries/kube-apiserver \
+          --bind-address=0.0.0.0 \
+          --etcd-servers=http://$private_ipv4:2379 \
+          --allow-privileged=true \
+          --service-cluster-ip-range=10.100.0.0/16 \
+          --cloud_provider=__CLOUDPROVIDER__ \
+          --secure-port=443 \
+          --insecure_bind_address=0.0.0.0 \
+          --advertise-address=$public_ipv4 \
+          --admission-control=NamespaceLifecycle,LimitRanger,ServiceAccount,ResourceQuota \
+          --tls-cert-file=/etc/kubernetes/ssl/apiserver.pem \
+          --tls-private-key-file=/etc/kubernetes/ssl/apiserver-key.pem \
+          --client-ca-file=/etc/kubernetes/ssl/ca.pem \
+          --service-account-key-file=/etc/kubernetes/ssl/apiserver-key.pem \
+          --runtime-config=extensions/v1beta1=true,extensions/v1beta1/networkpolicies=true \
+          --logtostderr=true
+        Restart=always
+        RestartSec=10
+    - name: kube-controller-manager.service
+      command: start
+      content: |
+        [Unit]
+        Description=Kubernetes Controller Manager
+        Documentation=https://github.com/GoogleCloudPlatform/kubernetes
+        Requires=kube-apiserver.service
+        After=kube-apiserver.service
+        [Service]
+        ExecStartPre=/opt/bin/wupiao $private_ipv4:8080
+        ExecStartPre=/bin/chmod +x /vagrant/binaries/kube-controller-manager
+        ExecStart=/vagrant/binaries/kube-controller-manager \
+          --master=$private_ipv4:8080 \
+          --service-account-private-key-file=/etc/kubernetes/ssl/apiserver-key.pem \
+          --root-ca-file=/etc/kubernetes/ssl/ca.pem \
+          --cloud_provider=__CLOUDPROVIDER__ \
+          --pod_eviction_timeout=30s \
+          --logtostderr=true
+        Restart=always
+        RestartSec=10
+    - name: kube-scheduler.service
+      command: start
+      content: |
+        [Unit]
+        Description=Kubernetes Scheduler
+        Documentation=https://github.com/GoogleCloudPlatform/kubernetes
+        Requires=kube-apiserver.service
+        After=kube-apiserver.service
+        [Service]
+        ExecStartPre=/opt/bin/wupiao $private_ipv4:8080
+        ExecStartPre=/bin/chmod +x /vagrant/binaries/kube-scheduler
+        ExecStart=/vagrant/binaries/kube-scheduler \
+          --master=$private_ipv4:8080
+        Restart=always
+        RestartSec=10
+  update:
+    group: __CHANNEL__
+    reboot-strategy: off
